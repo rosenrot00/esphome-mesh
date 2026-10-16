@@ -1,0 +1,20 @@
+{
+  "esphome_version": "2026.9.1",
+  "source": "esphome/components/network",
+  "original_sha256": {
+    "util.cpp": "62c13e3c495b6f8c7c3e5456d0c082df79c1ae71a6a8b5f127f981ca302bc848",
+    "network_component.h": "6c2ff738cfcb495ac219e24864157ee0528c533983d89d50565123dfccf59c31",
+    "__init__.py": "c01f2599616132538f89c2f1224521ae7adc22b6ada0c8b4b602fe5d0716ae20",
+    "util.h": "9bf1f95ac16700dce62051d52f61d69feba33777e1051621375abc72c463c45e",
+    "ip_address.h": "7bf1e25cc3902f4648e220d7d19dae36de6b960b43f127ef9a7f8159c4549032",
+    "network_component.cpp": "e7f691f86fcf043f739ebcc168340fecb127a3a1d364843665a44077b88e8df3"
+  },
+  "purpose": "External development overlay for a proposed generic fallback connection-provider API",
+  "upstream_extension_api": false,
+  "local_changes": [
+    "Bounded provider registration with state/address snapshots and no mesh dependency",
+    "Provider code gated by USE_NETWORK_PROVIDERS; native-only firmware has no registry dependency",
+    "Native connections retain precedence; priorities order fallback providers only",
+    "External overlay validates the installed base source hashes before compilation"
+  ]
+}

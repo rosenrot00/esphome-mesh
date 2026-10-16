@@ -1,0 +1,33 @@
+name: Experimental mesh test report
+description: Report a reproducible issue or a measured test result.
+body:
+  - type: input
+    id: versions
+    attributes:
+      label: Repository tag/commit and ESPHome/IDF versions
+    validations:
+      required: true
+  - type: input
+    id: hardware
+    attributes:
+      label: Chips, boards and power-save setting
+    validations:
+      required: true
+  - type: textarea
+    id: topology
+    attributes:
+      label: Topology and IPv4/IPv6 use
+      description: Which nodes have native WiFi and which use mesh?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps, expected result and actual result
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant redacted diagnostics
+      description: Remove passwords, keys and private identifiers. Do not attach secrets.yaml.

@@ -1,0 +1,45 @@
+esphome:
+  name: mesh-node-c
+  min_version: 2026.9.1
+
+esp32:
+  board: esp32-s3-devkitc-1
+  toolchain: esp-idf
+  framework:
+    type: esp-idf
+    version: 5.5.5
+
+logger:
+  level: INFO
+
+external_components:
+  - source: github://rosenrot00/esphome-mesh@v0.1.0-alpha.1
+    components: [mesh, network, wifi, espnow_driver]
+    refresh: never
+
+# No wifi or ethernet section: start through the mesh from fresh RAM.
+
+network:
+  enable_ipv6: true
+
+mesh:
+  id: mesh_node
+  key: !secret mesh_key
+
+api:
+  encryption:
+    key: !secret api_key
+  reboot_timeout: 0s
+
+ota:
+  - platform: esphome
+    encryption:
+
+web_server:
+  version: 3
+  port: 80
+
+binary_sensor:
+  - platform: template
+    name: Mesh connection
+    lambda: return id(mesh_node).mesh_connection_active();

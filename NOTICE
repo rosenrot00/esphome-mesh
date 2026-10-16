@@ -1,0 +1,6 @@
+This repository contains original mesh work and compatibility overlays derived from ESPHome.
+ESPHome project: https://github.com/esphome/esphome
+Copyright (c) 2019 ESPHome and its contributors, with subsequent contributions as applicable.
+The original ESPHome LICENSE is included without modification.
+Runtime/C++ files are licensed under GPLv3; Python and other files are licensed under MIT as specified in LICENSE.
+Compatibility overlays target ESPHome 2026.9.1. Per-file source identities are recorded in SOURCE_MANIFEST.json.

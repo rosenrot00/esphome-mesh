@@ -1,0 +1,930 @@
+diff --git a/esphome/compiled_config.py b/esphome/compiled_config.py
+index 0d855d71d..b7a60d7e8 100644
+--- a/esphome/compiled_config.py
++++ b/esphome/compiled_config.py
+@@ -17,7 +17,10 @@ import logging
+ from pathlib import Path
+ from typing import Any
+ 
+-from esphome.const import __version__ as ESPHOME_VERSION
++from esphome.const import (
++    KEY_CONNECTION_PROVIDER_ADDRESS,
++    __version__ as ESPHOME_VERSION,
++)
+ from esphome.core import CORE, EsphomeError, Lambda
+ from esphome.helpers import write_file
+ from esphome.storage_json import StorageJSON, ext_storage_path, storage_path
+@@ -29,7 +32,7 @@ _LOGGER = logging.getLogger(__name__)
+ # to read_config. The envelope also stamps the writing esphome version:
+ # after an upgrade the cache holds the previous release's validation, so
+ # it falls back once and the re-save self-heals.
+-_CACHE_VERSION = 1
++_CACHE_VERSION = 2
+ _LAMBDA_KEY = "__esphome_lambda__"
+ 
+ 
+@@ -55,7 +58,14 @@ def save_compiled_config(config: ConfigType) -> None:
+                 "Could not remove the legacy validated-config cache: %s", err
+             )
+         rendered = json.dumps(
+-            {"v": _CACHE_VERSION, "esphome": ESPHOME_VERSION, "config": config},
++            {
++                "v": _CACHE_VERSION,
++                "esphome": ESPHOME_VERSION,
++                "config": config,
++                KEY_CONNECTION_PROVIDER_ADDRESS: CORE.data.get(
++                    KEY_CONNECTION_PROVIDER_ADDRESS
++                ),
++            },
+             separators=(",", ":"),
+             default=_json_default,
+         )
+@@ -176,11 +186,20 @@ def load_compiled_config(conf_path: Path) -> ConfigType | None:
+         _LOGGER.debug("Ignoring compiled config cache with a foreign envelope")
+         return None
+ 
++    provider_address = envelope.get(KEY_CONNECTION_PROVIDER_ADDRESS)
++    if provider_address is not None and (
++        not isinstance(provider_address, str) or not provider_address
++    ):
++        return None
++
+     storage = StorageJSON.load(ext_storage_path(conf_path.name))
+     if storage is None or not storage.can_apply_to_core():
+         _LOGGER.debug("Ignoring compiled config cache: sidecar missing or incomplete")
+         return None
+     storage.apply_to_core()
++    CORE.data.pop(KEY_CONNECTION_PROVIDER_ADDRESS, None)
++    if provider_address is not None:
++        CORE.data[KEY_CONNECTION_PROVIDER_ADDRESS] = provider_address
+     return config
+ 
+ 
+diff --git a/esphome/components/network/__init__.py b/esphome/components/network/__init__.py
+index 89835128f..ee6b2a643 100644
+--- a/esphome/components/network/__init__.py
++++ b/esphome/components/network/__init__.py
+@@ -14,6 +14,7 @@ from esphome.const import (
+     CONF_MIN_IPV6_ADDR_COUNT,
+     CONF_PRIORITY,
+     CONF_WIFI,
++    KEY_CONNECTION_PROVIDER_ADDRESS,
+ )
+ from esphome.core import CORE, CoroPriority, coroutine_with_priority
+ import esphome.final_validate as fv
+@@ -134,6 +135,16 @@ async def register_active_interface_listener(listener: cg.MockObj) -> bool:
+ IPAddress = network_ns.class_("IPAddress")
+ 
+ 
++def register_connection_provider() -> None:
++    """Declare IP connectivity supplied by an additional connection provider.
++
++    Call during schema validation so uploads, logs and dashboard storage can
++    use the ordinary device hostname. Native interface address settings keep
++    their existing priority; MAC suffixes use the existing mDNS discovery path.
++    """
++    CORE.data[KEY_CONNECTION_PROVIDER_ADDRESS] = f"{CORE.name}.local"
++
++
+ def _register_provisioning_source(config: ConfigType) -> ConfigType:
+     """Register network connectivity as a provisioning source.
+ 
+diff --git a/esphome/components/network/connection_provider.cpp b/esphome/components/network/connection_provider.cpp
+new file mode 100644
+index 000000000..7607a59a0
+--- /dev/null
++++ b/esphome/components/network/connection_provider.cpp
+@@ -0,0 +1,65 @@
++#include "connection_provider.h"
++#if defined(USE_NETWORK) && defined(USE_NETWORK_PROVIDERS)
++
++namespace esphome::network {
++
++bool ConnectionProviderRegistry::register_provider(ConnectionProvider *provider, uint8_t priority) {
++  if (provider == nullptr || this->size_ == CAPACITY)
++    return false;
++  for (size_t i = 0; i < this->size_; ++i) {
++    if (this->entries_[i].provider == provider)
++      return false;
++  }
++  size_t position = this->size_;
++  while (position != 0 && this->entries_[position - 1].priority > priority) {
++    this->entries_[position] = this->entries_[position - 1];
++    --position;
++  }
++  this->entries_[position] = {provider, priority};
++  ++this->size_;
++  return true;
++}
++
++bool ConnectionProviderRegistry::unregister_provider(ConnectionProvider *provider) {
++  for (size_t i = 0; i < this->size_; ++i) {
++    if (this->entries_[i].provider != provider)
++      continue;
++    for (size_t j = i + 1; j < this->size_; ++j)
++      this->entries_[j - 1] = this->entries_[j];
++    this->entries_[--this->size_] = {};
++    return true;
++  }
++  return false;
++}
++
++bool ConnectionProviderRegistry::has_enabled_provider() const {
++  for (size_t i = 0; i < this->size_; ++i) {
++    if (this->entries_[i].provider->network_state().enabled)
++      return true;
++  }
++  return false;
++}
++
++bool ConnectionProviderRegistry::connected_addresses(IPAddresses &addresses) const {
++  for (size_t i = 0; i < this->size_; ++i) {
++    const auto state = this->entries_[i].provider->network_state();
++    if (!state.enabled || !state.connected)
++      continue;
++    for (const auto &address : state.addresses) {
++      if (!address.is_set())
++        continue;
++      addresses = state.addresses;
++      return true;
++    }
++  }
++  addresses = {};
++  return false;
++}
++
++ConnectionProviderRegistry &connection_provider_registry() {
++  static ConnectionProviderRegistry registry;
++  return registry;
++}
++
++}  // namespace esphome::network
++#endif
+diff --git a/esphome/components/network/connection_provider.h b/esphome/components/network/connection_provider.h
+new file mode 100644
+index 000000000..d68209c62
+--- /dev/null
++++ b/esphome/components/network/connection_provider.h
+@@ -0,0 +1,56 @@
++#pragma once
++
++#include "esphome/core/defines.h"
++#if defined(USE_NETWORK) && defined(USE_NETWORK_PROVIDERS)
++#include <array>
++#include <cstddef>
++#include <cstdint>
++#include "ip_address.h"
++
++namespace esphome::network {
++
++// Proposed generic extension boundary for additional ESPHome network interfaces.
++// Providers are independent of mesh and of any specific network SDK. Providers own their platform
++// routing/netif work; this contract only reports lifecycle and usable addresses.
++struct ConnectionProviderState {
++  // Enabled means the interface is allowed to establish a connection. It may be
++  // enabled while disconnected, just like an enabled Wi-Fi interface.
++  bool enabled{false};
++  bool connected{false};
++  IPAddresses addresses{};
++};
++
++class ConnectionProvider {
++ public:
++  virtual ~ConnectionProvider() = default;
++  virtual ConnectionProviderState network_state() const = 0;
++};
++
++// Bounded, allocation-free registration. Mutations and network utility queries
++// belong to ESPHome's application context; registration is not an ISR API.
++// Providers must unregister before destruction. A snapshot callback must not
++// mutate this registry. Priority 0 wins; equal priorities retain registration
++// order. Providers are fallback paths after native interfaces; priorities order only
++// registered providers. The network utility layer owns native precedence.
++class ConnectionProviderRegistry {
++ public:
++  static constexpr size_t CAPACITY = 4;
++  bool register_provider(ConnectionProvider *provider, uint8_t priority);
++  bool unregister_provider(ConnectionProvider *provider);
++  bool has_providers() const { return this->size_ != 0; }
++  bool has_enabled_provider() const;
++  bool connected_addresses(IPAddresses &addresses) const;
++
++ private:
++  struct Entry {
++    ConnectionProvider *provider{nullptr};
++    uint8_t priority{0};
++  };
++  std::array<Entry, CAPACITY> entries_{};
++  size_t size_{0};
++};
++
++ConnectionProviderRegistry &connection_provider_registry();
++
++}  // namespace esphome::network
++#endif
+diff --git a/esphome/components/network/util.cpp b/esphome/components/network/util.cpp
+index 11485fdcf..26bc1658d 100644
+--- a/esphome/components/network/util.cpp
++++ b/esphome/components/network/util.cpp
+@@ -10,9 +10,22 @@ namespace esphome::network {
+ // an AP that uses a previous interface for NAT).
+ 
+ bool is_disabled() {
+-  // The network is disabled only when every configured interface with a
+-  // disable() lifecycle is disabled; one enabled interface means traffic can flow.
++#if defined(USE_NETWORK_PROVIDERS) && (defined(USE_HOST) || defined(USE_OPENTHREAD))
++  // These native interfaces have no disable lifecycle. A disabled fallback
++  // provider cannot disable their connection.
++  return false;
++#else
++#ifdef USE_NETWORK_PROVIDERS
++  if (connection_provider_registry().has_enabled_provider())
++    return false;
++#endif
++    // The network is disabled only when every configured interface with a
++    // disable() lifecycle is disabled; one enabled interface means traffic can flow.
++#ifdef USE_NETWORK_PROVIDERS
++  bool disabled = connection_provider_registry().has_providers();
++#else
+   bool disabled = false;
++#endif
+ #ifdef USE_MODEM
+   if (modem::global_modem_component != nullptr) {
+     if (!modem::global_modem_component->is_disabled())
+@@ -37,6 +50,7 @@ bool is_disabled() {
+   }
+ #endif
+   return disabled;
++#endif
+ }
+ 
+ const char *get_use_address_to(std::span<char, USE_ADDRESS_BUFFER_SIZE> buf) {
+@@ -66,6 +80,13 @@ const char *get_use_address_to(std::span<char, USE_ADDRESS_BUFFER_SIZE> buf) {
+ }
+ 
+ network::IPAddresses get_ip_addresses() {
++#ifdef USE_NETWORK_PROVIDERS
++  if (!is_native_connected()) {
++    IPAddresses provider_addresses;
++    if (connection_provider_registry().connected_addresses(provider_addresses))
++      return provider_addresses;
++  }
++#endif
+   // With a wifi-first network: priority: list, prefer wifi while it has a valid IP;
+   // otherwise fall through to the fixed ethernet-first order below. Selection based
+   // on the runtime-active interface is a planned follow-up.
+diff --git a/esphome/components/network/util.h b/esphome/components/network/util.h
+index 57c5a6683..0fa1ccbae 100644
+--- a/esphome/components/network/util.h
++++ b/esphome/components/network/util.h
+@@ -5,6 +5,9 @@
+ #include <string>
+ #include "esphome/core/helpers.h"
+ #include "ip_address.h"
++#ifdef USE_NETWORK_PROVIDERS
++#include "connection_provider.h"
++#endif
+ 
+ #ifdef USE_ETHERNET
+ #include "esphome/components/ethernet/ethernet_component.h"
+@@ -25,7 +28,7 @@ namespace esphome::network {
+ // an AP that uses a previous interface for NAT).
+ 
+ /// Return whether the node is connected to the network (through wifi, eth, ...)
+-ESPHOME_ALWAYS_INLINE inline bool is_connected() {
++ESPHOME_ALWAYS_INLINE inline bool is_native_connected() {
+   // With a single interface enabled the checks below collapse to `if (x) return true; return false;`, which
+   // clang-tidy wants folded into one return. Keep the per-interface form so every enabled interface is checked.
+   // NOLINTBEGIN(readability-simplify-boolean-expr)
+@@ -56,6 +59,18 @@ ESPHOME_ALWAYS_INLINE inline bool is_connected() {
+   // NOLINTEND(readability-simplify-boolean-expr)
+ }
+ 
++/// Native interfaces retain their existing priority; registered providers are fallbacks.
++ESPHOME_ALWAYS_INLINE inline bool is_connected() {
++  if (is_native_connected())
++    return true;
++#ifdef USE_NETWORK_PROVIDERS
++  IPAddresses provider_addresses;
++  return connection_provider_registry().connected_addresses(provider_addresses);
++#else
++  return false;
++#endif
++}
++
+ /// Return whether the network is disabled: every configured interface with a
+ /// disable() lifecycle (modem, wifi, ethernet) is disabled.
+ bool is_disabled();
+diff --git a/esphome/const.py b/esphome/const.py
+index 115ccad74..2fae51845 100644
+--- a/esphome/const.py
++++ b/esphome/const.py
+@@ -1437,6 +1437,8 @@ STATE_CLASS_TOTAL_INCREASING = "total_increasing"
+ STATE_CLASS_TOTAL = "total"
+ 
+ KEY_CORE = "core"
++# Python metadata for an IP connection provider with no native interface config.
++KEY_CONNECTION_PROVIDER_ADDRESS = "connection_provider_address"
+ KEY_TARGET_PLATFORM = "target_platform"
+ KEY_TARGET_FRAMEWORK = "target_framework"
+ KEY_FRAMEWORK_VERSION = "framework_version"
+diff --git a/esphome/core/__init__.py b/esphome/core/__init__.py
+index 9b8f9f986..4e99ccb2a 100644
+--- a/esphome/core/__init__.py
++++ b/esphome/core/__init__.py
+@@ -18,6 +18,7 @@ from esphome.const import (
+     CONF_USE_ADDRESS,
+     CONF_WEB_SERVER,
+     CONF_WIFI,
++    KEY_CONNECTION_PROVIDER_ADDRESS,
+     KEY_CORE,
+     KEY_TARGET_FRAMEWORK,
+     KEY_TARGET_PLATFORM,
+@@ -771,7 +772,7 @@ class EsphomeCore:
+         if CONF_OPENTHREAD in self.config:
+             return f"{self.name}.local"
+ 
+-        return None
++        return self.data.get(KEY_CONNECTION_PROVIDER_ADDRESS)
+ 
+     @property
+     def web_port(self) -> int | None:
+@@ -867,7 +868,9 @@ class EsphomeCore:
+         Is a network component configured?
+         :return: true if so
+         """
+-        return self.has_at_least_one_component("wifi", "ethernet", "openthread")
++        return self.has_at_least_one_component(
++            "wifi", "ethernet", "openthread"
++        ) or bool(self.data.get(KEY_CONNECTION_PROVIDER_ADDRESS))
+ 
+     def relative_config_path(self, *path: str | Path) -> Path:
+         path_ = Path(*path).expanduser()
+diff --git a/esphome/core/defines.h b/esphome/core/defines.h
+index 3d14494df..5a33ebe03 100644
+--- a/esphome/core/defines.h
++++ b/esphome/core/defines.h
+@@ -223,6 +223,7 @@
+ #define USE_NETWORK
+ #define USE_NETWORK_DEFAULT_ROUTE
+ #define USE_NETWORK_PRIMARY_INTERFACE_WIFI
++#define USE_NETWORK_PROVIDERS
+ #define USE_NEXTION_COMMAND_SPACING
+ #define USE_NEXTION_CONF_START_UP_PAGE
+ #define USE_NEXTION_CONFIG_EXIT_REPARSE_ON_START
+diff --git a/tests/components/network/__init__.py b/tests/components/network/__init__.py
+index 101f63ac8..053d03bbe 100644
+--- a/tests/components/network/__init__.py
++++ b/tests/components/network/__init__.py
+@@ -8,6 +8,8 @@ def override_manifest(manifest: ComponentManifestOverride) -> None:
+ 
+     async def to_code_testing(config):
+         await real_to_code(config)
++        cg.add_define("USE_NETWORK")
++        cg.add_define("USE_NETWORK_PROVIDERS")
+         cg.add_define("USE_NETWORK_IPV6", True)
+ 
+     manifest.to_code = to_code_testing
+diff --git a/tests/components/network/test_connection_provider.cpp b/tests/components/network/test_connection_provider.cpp
+new file mode 100644
+index 000000000..8cc587b02
+--- /dev/null
++++ b/tests/components/network/test_connection_provider.cpp
+@@ -0,0 +1,200 @@
++#include <gtest/gtest.h>
++
++#include <array>
++
++#include "esphome/components/network/connection_provider.h"
++#include "esphome/components/network/util.h"
++
++#if defined(USE_NETWORK) && defined(USE_NETWORK_PROVIDERS)
++namespace esphome::network::testing {
++
++class TestConnectionProvider : public ConnectionProvider {
++ public:
++  ConnectionProviderState state{};
++
++  ConnectionProviderState network_state() const override { return this->state; }
++};
++
++class ConnectionProviderRegistryTest : public ::testing::Test {
++ protected:
++  void TearDown() override {
++    for (auto &provider : this->providers_)
++      this->registry_.unregister_provider(&provider);
++  }
++
++  void connect(size_t index, const char *address) {
++    auto &state = this->providers_[index].state;
++    state.enabled = true;
++    state.connected = true;
++    state.addresses[0] = IPAddress(address);
++  }
++
++  std::array<TestConnectionProvider, ConnectionProviderRegistry::CAPACITY + 1> providers_{};
++  ConnectionProviderRegistry registry_{};
++};
++
++TEST_F(ConnectionProviderRegistryTest, EmptyRegistryClearsPreviousAddresses) {
++  IPAddresses addresses{};
++  addresses[0] = IPAddress("192.0.2.1");
++
++  EXPECT_FALSE(this->registry_.has_providers());
++  EXPECT_FALSE(this->registry_.has_enabled_provider());
++  EXPECT_FALSE(this->registry_.connected_addresses(addresses));
++  for (const auto &address : addresses)
++    EXPECT_FALSE(address.is_set());
++}
++
++TEST_F(ConnectionProviderRegistryTest, RejectsNullAndDuplicateWithoutChangingPriority) {
++  this->connect(0, "192.0.2.1");
++  this->connect(1, "192.0.2.2");
++  EXPECT_FALSE(this->registry_.register_provider(nullptr, 0));
++  ASSERT_TRUE(this->registry_.register_provider(&this->providers_[0], 100));
++  EXPECT_FALSE(this->registry_.register_provider(&this->providers_[0], 0));
++  ASSERT_TRUE(this->registry_.register_provider(&this->providers_[1], 50));
++
++  IPAddresses addresses{};
++  ASSERT_TRUE(this->registry_.connected_addresses(addresses));
++  EXPECT_EQ(addresses[0], IPAddress("192.0.2.2"));
++}
++
++TEST_F(ConnectionProviderRegistryTest, CapacityCanBeReusedAfterUnregister) {
++  for (size_t i = 0; i < ConnectionProviderRegistry::CAPACITY; ++i)
++    ASSERT_TRUE(this->registry_.register_provider(&this->providers_[i], 100));
++  auto &replacement = this->providers_.back();
++  replacement.state.enabled = true;
++  replacement.state.connected = true;
++  replacement.state.addresses[0] = IPAddress("192.0.2.9");
++  EXPECT_FALSE(this->registry_.register_provider(&replacement, 0));
++  ASSERT_TRUE(this->registry_.unregister_provider(&this->providers_[1]));
++  ASSERT_TRUE(this->registry_.register_provider(&replacement, 0));
++
++  IPAddresses addresses{};
++  ASSERT_TRUE(this->registry_.connected_addresses(addresses));
++  EXPECT_EQ(addresses[0], IPAddress("192.0.2.9"));
++}
++
++TEST_F(ConnectionProviderRegistryTest, UnregisterPreservesOtherProviders) {
++  this->connect(0, "192.0.2.1");
++  this->connect(1, "192.0.2.2");
++  ASSERT_TRUE(this->registry_.register_provider(&this->providers_[0], 0));
++  ASSERT_TRUE(this->registry_.register_provider(&this->providers_[1], 1));
++  EXPECT_FALSE(this->registry_.unregister_provider(nullptr));
++  EXPECT_FALSE(this->registry_.unregister_provider(&this->providers_[2]));
++  ASSERT_TRUE(this->registry_.unregister_provider(&this->providers_[0]));
++  EXPECT_FALSE(this->registry_.unregister_provider(&this->providers_[0]));
++
++  IPAddresses addresses{};
++  ASSERT_TRUE(this->registry_.connected_addresses(addresses));
++  EXPECT_EQ(addresses[0], IPAddress("192.0.2.2"));
++  ASSERT_TRUE(this->registry_.unregister_provider(&this->providers_[1]));
++  EXPECT_FALSE(this->registry_.has_providers());
++  EXPECT_FALSE(this->registry_.has_enabled_provider());
++  EXPECT_FALSE(this->registry_.connected_addresses(addresses));
++  EXPECT_FALSE(addresses[0].is_set());
++}
++
++TEST_F(ConnectionProviderRegistryTest, LowestPriorityWinsAndEqualPriorityIsStable) {
++  this->connect(0, "192.0.2.1");
++  this->connect(1, "192.0.2.2");
++  this->connect(2, "192.0.2.3");
++  ASSERT_TRUE(this->registry_.register_provider(&this->providers_[0], 20));
++  ASSERT_TRUE(this->registry_.register_provider(&this->providers_[1], 0));
++  ASSERT_TRUE(this->registry_.register_provider(&this->providers_[2], 0));
++
++  IPAddresses addresses{};
++  ASSERT_TRUE(this->registry_.connected_addresses(addresses));
++  EXPECT_EQ(addresses[0], IPAddress("192.0.2.2"));
++  ASSERT_TRUE(this->registry_.unregister_provider(&this->providers_[1]));
++  ASSERT_TRUE(this->registry_.connected_addresses(addresses));
++  EXPECT_EQ(addresses[0], IPAddress("192.0.2.3"));
++}
++
++TEST_F(ConnectionProviderRegistryTest, EnabledDoesNotImplyConnected) {
++  auto &state = this->providers_[0].state;
++  state.enabled = true;
++  state.addresses[0] = IPAddress("192.0.2.1");
++  ASSERT_TRUE(this->registry_.register_provider(&this->providers_[0], 0));
++
++  IPAddresses addresses{};
++  EXPECT_TRUE(this->registry_.has_enabled_provider());
++  EXPECT_FALSE(this->registry_.connected_addresses(addresses));
++  state.connected = true;
++  ASSERT_TRUE(this->registry_.connected_addresses(addresses));
++  EXPECT_EQ(addresses[0], IPAddress("192.0.2.1"));
++  state.enabled = false;
++  EXPECT_FALSE(this->registry_.has_enabled_provider());
++  EXPECT_FALSE(this->registry_.connected_addresses(addresses));
++  EXPECT_FALSE(addresses[0].is_set());
++}
++
++TEST_F(ConnectionProviderRegistryTest, MissingUsableAddressFallsBackToNextProvider) {
++  auto &preferred = this->providers_[0].state;
++  preferred.enabled = true;
++  preferred.connected = true;
++  this->connect(1, "192.0.2.2");
++  ASSERT_TRUE(this->registry_.register_provider(&this->providers_[0], 0));
++  ASSERT_TRUE(this->registry_.register_provider(&this->providers_[1], 10));
++
++  IPAddresses addresses{};
++  ASSERT_TRUE(this->registry_.connected_addresses(addresses));
++  EXPECT_EQ(addresses[0], IPAddress("192.0.2.2"));
++  preferred.addresses[0] = IPAddress("192.0.2.1");
++  ASSERT_TRUE(this->registry_.connected_addresses(addresses));
++  EXPECT_EQ(addresses[0], IPAddress("192.0.2.1"));
++}
++
++TEST_F(ConnectionProviderRegistryTest, DisconnectionDoesNotReturnStaleAddresses) {
++  this->connect(0, "192.0.2.1");
++  ASSERT_TRUE(this->registry_.register_provider(&this->providers_[0], 0));
++  IPAddresses addresses{};
++  ASSERT_TRUE(this->registry_.connected_addresses(addresses));
++  this->providers_[0].state.connected = false;
++
++  EXPECT_TRUE(this->registry_.has_enabled_provider());
++  EXPECT_FALSE(this->registry_.connected_addresses(addresses));
++  for (const auto &address : addresses)
++    EXPECT_FALSE(address.is_set());
++}
++
++#ifdef USE_HOST
++TEST_F(ConnectionProviderRegistryTest, DisabledProviderDoesNotDisableHostNetwork) {
++  auto &registry = connection_provider_registry();
++  auto &provider = this->providers_[0];
++  provider.state.enabled = false;
++  ASSERT_TRUE(registry.register_provider(&provider, 0));
++
++  EXPECT_FALSE(is_disabled());
++
++  EXPECT_TRUE(registry.unregister_provider(&provider));
++}
++#endif
++
++#if USE_NETWORK_IPV6
++TEST_F(ConnectionProviderRegistryTest, IPv6OnlyAddressInLastSlotIsUsable) {
++  auto &state = this->providers_[0].state;
++  state.enabled = true;
++  state.connected = true;
++  state.addresses.back() = IPAddress("2001:db8::1");
++  ASSERT_TRUE(this->registry_.register_provider(&this->providers_[0], 0));
++
++  IPAddresses addresses{};
++  ASSERT_TRUE(this->registry_.connected_addresses(addresses));
++  EXPECT_EQ(addresses, state.addresses);
++  EXPECT_TRUE(addresses.back().is_ip6());
++  EXPECT_FALSE(addresses[0].is_set());
++}
++
++TEST_F(ConnectionProviderRegistryTest, ReturnsCompleteDualStackSnapshot) {
++  this->connect(0, "192.0.2.1");
++  this->providers_[0].state.addresses[1] = IPAddress("2001:db8::1");
++  this->providers_[0].state.addresses[4] = IPAddress("fe80::1");
++  ASSERT_TRUE(this->registry_.register_provider(&this->providers_[0], 0));
++
++  IPAddresses addresses{};
++  ASSERT_TRUE(this->registry_.connected_addresses(addresses));
++  EXPECT_EQ(addresses, this->providers_[0].state.addresses);
++}
++#endif
++
++}  // namespace esphome::network::testing
++#endif
+diff --git a/tests/unit_tests/components/network/fixtures/components/generic_provider/__init__.py b/tests/unit_tests/components/network/fixtures/components/generic_provider/__init__.py
+new file mode 100644
+index 000000000..3b92af3b2
+--- /dev/null
++++ b/tests/unit_tests/components/network/fixtures/components/generic_provider/__init__.py
+@@ -0,0 +1,16 @@
++"""Synthetic IP connection provider: validation only, never built/flashed."""
++
++from esphome.components.network import register_connection_provider
++import esphome.config_validation as cv
++from esphome.types import ConfigType
++
++AUTO_LOAD = ["network"]
++DOMAIN = "generic_provider"
++
++
++def _declare(config: ConfigType) -> ConfigType:
++    register_connection_provider()
++    return config
++
++
++CONFIG_SCHEMA = cv.All(cv.Schema({}), _declare)
+diff --git a/tests/unit_tests/components/network/test_connection_provider.py b/tests/unit_tests/components/network/test_connection_provider.py
+new file mode 100644
+index 000000000..fb502584d
+--- /dev/null
++++ b/tests/unit_tests/components/network/test_connection_provider.py
+@@ -0,0 +1,235 @@
++"""Generic provider metadata through actual validation, CLI and warm cache.
++
++No compile, device transfer, or network I/O is performed. Only mDNS discovery
++is mocked at the external-I/O boundary; CORE and the CLI are real modules.
++"""
++
++from itertools import combinations
++import json
++import os
++from pathlib import Path
++import tempfile
++import unittest
++from unittest.mock import patch
++
++import yaml
++
++from esphome import __main__ as cli
++from esphome.compiled_config import (
++    compiled_config_path,
++    load_compiled_config,
++    save_compiled_config,
++)
++from esphome.components.network import register_connection_provider
++from esphome.config import read_config
++from esphome.const import (
++    KEY_CONNECTION_PROVIDER_ADDRESS,
++    KEY_CORE,
++    KEY_TARGET_FRAMEWORK,
++    KEY_TARGET_PLATFORM,
++)
++from esphome.core import CORE, EsphomeError
++from esphome.storage_json import StorageJSON, storage_path
++from esphome.types import ConfigType
++
++EXAMPLE = Path(
++    os.environ.get(
++        "PROVIDER_TEST_EXAMPLE", Path(__file__).parent / "fixtures/components"
++    )
++).resolve()
++
++
++class ConnectionProviderTests(unittest.TestCase):
++    def setUp(self) -> None:
++        CORE.reset()
++        self.directory = tempfile.TemporaryDirectory(prefix="connection-provider-")
++        self.addCleanup(self.directory.cleanup)
++        self.config_path = Path(self.directory.name) / "provider.yaml"
++        self.config_path.write_text("# Synthetic, no secrets\n", encoding="utf-8")
++        self.base_core()
++
++    def tearDown(self) -> None:
++        CORE.reset()
++
++    def base_core(self, *, suffix: bool = False) -> None:
++        CORE.config_path = self.config_path
++        CORE.name = "provider-node"
++        CORE.build_path = Path(self.directory.name) / "build"
++        CORE.data[KEY_CORE] = {
++            KEY_TARGET_PLATFORM: "host",
++            KEY_TARGET_FRAMEWORK: "host",
++        }
++        CORE.config = {
++            "esphome": {"name": CORE.name, "name_add_mac_suffix": suffix},
++            "api": {},
++            "ota": [{"platform": "esphome"}],
++        }
++
++    def validated(self, *, suffix: bool = False) -> ConfigType:
++        CORE.reset()
++        config = {
++            "esphome": {"name": "provider-node", "name_add_mac_suffix": suffix},
++            "esp32": {
++                "board": "esp32-s3-devkitc-1",
++                "variant": "esp32s3",
++                "framework": {"type": "esp-idf", "version": "5.5.5"},
++            },
++            "external_components": [
++                {
++                    "source": {"type": "local", "path": str(EXAMPLE)},
++                    "components": ["generic_provider"],
++                }
++            ],
++            "generic_provider": {},
++            "logger": {},
++            "api": {},
++            "ota": [{"platform": "esphome"}],
++        }
++        self.config_path.write_text(
++            yaml.safe_dump(config, sort_keys=False), encoding="utf-8"
++        )
++        CORE.config_path = self.config_path
++        validated = read_config({})
++        self.assertIsNotNone(validated)
++        CORE.config = validated
++        return validated
++
++    def assert_default_cli(self, expected: str = "provider-node.local") -> None:
++        for purpose in (cli.Purpose.UPLOADING, cli.Purpose.LOGGING):
++            with self.subTest(purpose=purpose):
++                self.assertEqual(
++                    cli.choose_upload_log_host("OTA", None, purpose), [expected]
++                )
++
++    def cache_and_reset(self) -> Path:
++        config = CORE.config
++        sidecar = StorageJSON.from_esphome_core(CORE, None, claim_build=False)
++        sidecar.save(storage_path())
++        save_compiled_config(config)
++        cache_path = compiled_config_path(self.config_path.name)
++        CORE.reset()
++        CORE.config_path = self.config_path
++        return cache_path
++
++    def test_unregistered_network_component_is_not_connectivity(self) -> None:
++        CORE.config["network"] = {}
++        self.assertIsNone(CORE.address)
++        self.assertFalse(CORE.has_networking)
++        with self.assertRaises(EsphomeError):
++            cli.choose_upload_log_host("OTA", None, cli.Purpose.UPLOADING)
++        self.assertEqual(
++            cli.choose_upload_log_host("known-node.local", None, cli.Purpose.UPLOADING),
++            ["known-node.local"],
++        )
++
++    def test_native_interfaces_retain_every_existing_priority(self) -> None:
++        interfaces = ("wifi", "ethernet", "openthread")
++        for count in range(1, 4):
++            for selected in combinations(interfaces, count):
++                for provider in (False, True):
++                    with self.subTest(selected=selected, provider=provider):
++                        CORE.reset()
++                        self.base_core()
++                        for native in selected:
++                            CORE.config[native] = {"use_address": f"{native}.example"}
++                        if provider:
++                            register_connection_provider()
++                        self.assertEqual(CORE.address, f"{selected[0]}.example")
++                        self.assertTrue(CORE.has_networking)
++                        self.assert_default_cli(f"{selected[0]}.example")
++
++    def test_registration_is_idempotent_and_core_reset_clears_it(self) -> None:
++        register_connection_provider()
++        register_connection_provider()
++        self.assertEqual(CORE.address, "provider-node.local")
++        self.assertTrue(CORE.has_networking)
++        self.assertEqual(CORE.data[KEY_CONNECTION_PROVIDER_ADDRESS], CORE.address)
++        CORE.reset()
++        self.base_core()
++        self.assertIsNone(CORE.address)
++        self.assertFalse(CORE.has_networking)
++
++    def test_real_cold_validation_cli_and_storage_without_native_interfaces(
++        self,
++    ) -> None:
++        config = self.validated()
++        self.assertFalse(any(n in config for n in ("wifi", "ethernet", "openthread")))
++        self.assertEqual(CORE.address, "provider-node.local")
++        self.assertTrue(CORE.has_networking)
++        self.assert_default_cli()
++        sidecar = StorageJSON.from_esphome_core(CORE, None, claim_build=False)
++        self.assertEqual(json.loads(sidecar.to_json())["address"], CORE.address)
++        sidecar.save(storage_path())
++        self.assertEqual(StorageJSON.load(storage_path()).address, CORE.address)
++
++    def test_warm_cache_restores_provider_without_importing_validator(self) -> None:
++        self.validated()
++        cache_path = self.cache_and_reset()
++        envelope = json.loads(cache_path.read_text())
++        self.assertEqual(
++            envelope[KEY_CONNECTION_PROVIDER_ADDRESS], "provider-node.local"
++        )
++        config = load_compiled_config(self.config_path)
++        self.assertIsNotNone(config)
++        CORE.config = config
++        self.assertEqual(CORE.address, "provider-node.local")
++        self.assertTrue(CORE.has_networking)
++        self.assert_default_cli()
++
++    def test_non_provider_cache_does_not_inherit_provider_metadata(self) -> None:
++        cache_path = self.cache_and_reset()
++        self.assertIsNone(
++            json.loads(cache_path.read_text())[KEY_CONNECTION_PROVIDER_ADDRESS]
++        )
++        CORE.data[KEY_CONNECTION_PROVIDER_ADDRESS] = "stale.local"
++        CORE.config = load_compiled_config(self.config_path)
++        self.assertIsNotNone(CORE.config)
++        self.assertIsNone(CORE.address)
++        self.assertFalse(CORE.has_networking)
++
++    def test_old_cache_and_malformed_provider_metadata_fall_back_to_validation(
++        self,
++    ) -> None:
++        register_connection_provider()
++        cache_path = self.cache_and_reset()
++        original = json.loads(cache_path.read_text())
++        for value in ([], {}, "", 42):
++            with self.subTest(value=value):
++                modified = dict(original, **{KEY_CONNECTION_PROVIDER_ADDRESS: value})
++                cache_path.write_text(json.dumps(modified), encoding="utf-8")
++                self.assertIsNone(load_compiled_config(self.config_path))
++        original["v"] = 1
++        cache_path.write_text(json.dumps(original), encoding="utf-8")
++        self.assertIsNone(load_compiled_config(self.config_path))
++
++    def test_name_mac_suffix_uses_existing_cli_discovery_cold_and_warm(self) -> None:
++        self.validated(suffix=True)
++        for warm in (False, True):
++            with self.subTest(warm=warm):
++                if warm:
++                    self.cache_and_reset()
++                    CORE.config = load_compiled_config(self.config_path)
++                    self.assertIsNotNone(CORE.config)
++                discovered = {"provider-node-aabbcc.local": ["2001:db8::123"]}
++                with patch(
++                    "esphome.zeroconf.discover_mdns_devices", return_value=discovered
++                ) as lookup:
++                    self.assert_default_cli("provider-node-aabbcc.local")
++                self.assertEqual(lookup.call_count, 2)
++                self.assertEqual(
++                    CORE.address_cache.get_addresses("provider-node-aabbcc.local"),
++                    ["2001:db8::123"],
++                )
++
++    def test_mac_suffix_no_match_does_not_fall_back_to_nonexistent_base(self) -> None:
++        self.base_core(suffix=True)
++        register_connection_provider()
++        with (
++            patch("esphome.zeroconf.discover_mdns_devices", return_value={}),
++            self.assertRaises(EsphomeError),
++        ):
++            cli.choose_upload_log_host("OTA", None, cli.Purpose.UPLOADING)
++
++
++if __name__ == "__main__":
++    unittest.main(verbosity=2)
+diff --git a/tests/unit_tests/fixtures/lazy_imports/upload_command_fast_path.py b/tests/unit_tests/fixtures/lazy_imports/upload_command_fast_path.py
+index f70a3f85a..0a0d3b0de 100644
+--- a/tests/unit_tests/fixtures/lazy_imports/upload_command_fast_path.py
++++ b/tests/unit_tests/fixtures/lazy_imports/upload_command_fast_path.py
+@@ -49,7 +49,7 @@ with tempfile.TemporaryDirectory() as _td:
+     cache_path.write_text(
+         json.dumps(
+             {
+-                "v": 1,
++                "v": 2,
+                 "esphome": ESPHOME_VERSION,
+                 "config": {
+                     "esphome": {"name": "t"},
+diff --git a/tests/unit_tests/test_compiled_config.py b/tests/unit_tests/test_compiled_config.py
+index 4333420a9..b8d8330c3 100644
+--- a/tests/unit_tests/test_compiled_config.py
++++ b/tests/unit_tests/test_compiled_config.py
+@@ -58,7 +58,7 @@ _VALIDATED_CONFIG = {
+ def _cache_body(config: dict | None = None) -> str:
+     """Render the JSON envelope the production save writes."""
+     return json.dumps(
+-        {"v": 1, "esphome": const.__version__, "config": config or _VALIDATED_CONFIG}
++        {"v": 2, "esphome": const.__version__, "config": config or _VALIDATED_CONFIG}
+     )
+ 
+ 
+@@ -214,7 +214,7 @@ def test_load_compiled_config_falls_back(tmp_path: Path, scenario: str) -> None:
+     elif scenario == "corrupt_cache":
+         _write_storage(sidecar_path)
+         _set_cache_mtime(
+-            _write_cache(cache_path, '{"v": 1, "config": {'), yaml_path, offset=5
++            _write_cache(cache_path, '{"v": 2, "config": {'), yaml_path, offset=5
+         )
+     elif scenario == "missing_sidecar":
+         # Cache fresh + parseable, but no StorageJSON → can't populate CORE.
+@@ -237,17 +237,17 @@ def test_load_compiled_config_falls_back(tmp_path: Path, scenario: str) -> None:
+             id="missing_version",
+         ),
+         pytest.param(
+-            json.dumps({"v": 1, "esphome": "2020.1.0", "config": {"esphome": {}}}),
++            json.dumps({"v": 2, "esphome": "2020.1.0", "config": {"esphome": {}}}),
+             id="other_esphome_version",
+         ),
+         pytest.param(
+-            json.dumps({"v": 1, "config": {"esphome": {}}}),
++            json.dumps({"v": 2, "config": {"esphome": {}}}),
+             id="missing_esphome_version",
+         ),
+         pytest.param(
+             json.dumps(
+                 {
+-                    "v": 1,
++                    "v": 2,
+                     "esphome": const.__version__,
+                     "config": ["not", "a", "dict"],
+                 }
+@@ -255,7 +255,7 @@ def test_load_compiled_config_falls_back(tmp_path: Path, scenario: str) -> None:
+             id="non_dict_config",
+         ),
+         pytest.param(
+-            json.dumps({"v": 1, "esphome": const.__version__}), id="missing_config"
++            json.dumps({"v": 2, "esphome": const.__version__}), id="missing_config"
+         ),
+         pytest.param(json.dumps(["not", "an", "envelope"]), id="non_dict_envelope"),
+     ],
+@@ -776,7 +776,7 @@ def test_save_compiled_config_writes_cache(tmp_path: Path) -> None:
+     cache_path = compiled_config_path("lite_test.yaml")
+     assert cache_path.is_file()
+     envelope = json.loads(cache_path.read_text())
+-    assert envelope["v"] == 1
++    assert envelope["v"] == 2
+     assert envelope["esphome"] == const.__version__
+     assert envelope["config"] == {"esphome": {"name": "lite_test"}, "logger": {}}
+ 

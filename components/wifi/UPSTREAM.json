@@ -1,0 +1,23 @@
+{
+  "esphome_version": "2026.9.1",
+  "source": "esphome/components/wifi",
+  "original_sha256": {
+    "__init__.py": "b730f2bd42696461159b3fa152cc031b1486875bbaf539dbaca920232b4884ee",
+    "automation.h": "ca1eec7e0d9b5608df406021a137e13ceba7806cef5c20fccb7da62a9d68114a",
+    "scan_list.h": "031f47d6c8ee255b0fd75dc2785f199e777d1062a2a144260a10bfb69ef0238d",
+    "wifi_component.cpp": "eb702ee952d594372011a3371c41ba37aa44eccecff0d3b687f23d64303ce6ce",
+    "wifi_component.h": "a6e3273e16d461e73d954b20b2c780fe1f903feee567582c03486c55e532c969",
+    "wifi_component_esp8266.cpp": "29e66662a9cd8c3725febb125f1bbf4bc386d3ee63153bc5076252bc8e1d2b6b",
+    "wifi_component_esp_idf.cpp": "c6980e4ab5cccf46ab07ead1b8dbd830f21f35fa09a62779fed009dff1aa1433",
+    "wifi_component_libretiny.cpp": "76927ea50576025a75e65ddcc77fa453a031b5de187962228afaee451b70fabf",
+    "wifi_component_pico_w.cpp": "a6c06a0e20d6fbb7bab752e342ae9b5326776035bfea7ad9ad2597b716872a9d",
+    "wpa2_eap.py": "91d7c77f2ec0f19f24bf1e52ab1b4886c3eaacf60c95d327ce61e92853b4646b"
+  },
+  "purpose": "External development overlay for a generic externally observed access-point connection hint",
+  "upstream_extension_api": false,
+  "local_changes": [
+    "Revalidate one externally observed AP against current stock credentials before normal scanning",
+    "Keep existing enable/start behavior and native IP ownership unchanged",
+    "External overlay validates installed base source hashes before compilation"
+  ]
+}

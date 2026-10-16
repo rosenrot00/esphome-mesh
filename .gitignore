@@ -1,0 +1,11 @@
+.esphome/
+.pioenvs/
+.piolibdeps/
+__pycache__/
+.pytest_cache/
+.venv/
+.DS_Store
+secrets.yaml
+*.bin
+*.elf
+*.map
