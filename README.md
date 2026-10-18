@@ -67,6 +67,10 @@ The roadmap uses stable step IDs. Future PRs can link to their step and to archi
 
 Related community requests: [feature request #1108](https://github.com/esphome/feature-requests/issues/1108) and [Wifi Mesh discussion #3211](https://github.com/orgs/esphome/discussions/3211). This ESP-NOW prototype is independent of the Mesh-Lite and other approaches discussed there.
 
+## Acknowledgments
+
+This project was informed by the ideas and requirements shared in the [ESPHome WiFi Mesh discussion](https://github.com/orgs/esphome/discussions/3211). Thanks to everyone who contributed, particularly [RubenKelevra](https://github.com/RubenKelevra) for his detailed architectural explanations and insights.
+
 ## License
 
 This repository retains [ESPHome's dual license](LICENSE): C++ runtime files are GPLv3; Python and other files are MIT. See [NOTICE](NOTICE) for source provenance.
